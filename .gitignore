@@ -1,0 +1,7 @@
+db/denv/
+ml/mlvenv/
+__pycache__/
+*.pyc
+.env
+db/pyrightconfig.json
+ml/pyrightconfig.json
