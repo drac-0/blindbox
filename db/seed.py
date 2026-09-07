@@ -13,7 +13,7 @@ database:
 
 import random
 import string
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 
 from database import Base, engine, SessionLocal
 from models import (
@@ -30,6 +30,7 @@ db = SessionLocal()
 N_MERCHANTS = 8
 N_CUSTOMERS = 20
 BOXES_PER_STORE = 5
+GUARANTEED_YESTERDAY_RESERVATIONS_PER_STORE = 2  # ensures previous_sales is never 0 right after seeding
 CATEGORIES = ["Bakery", "Cafe", "Restaurant"]
 STORE_NAMES = [
     "Roti Segar", "Kopi Senja", "Warung Padang Berkah", "Bakery Manis",
@@ -44,6 +45,20 @@ CUSTOMER_NAMES = [
 
 def random_qr_code():
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
+
+
+def random_opening_time():
+    # Varies each store's opening hour so SmartStock predictions differ
+    # meaningfully between stores instead of all using the same default.
+    return time(random.randint(6, 10), random.choice([0, 15, 30, 45]))
+
+
+def yesterday_random_time():
+    yesterday = datetime.utcnow() - timedelta(days=1)
+    return yesterday.replace(
+        hour=random.randint(8, 20), minute=random.randint(0, 59),
+        second=0, microsecond=0,
+    )
 
 
 try:
@@ -72,7 +87,7 @@ try:
 
     db.flush()  # assigns IDs without committing yet
 
-    # --- Stores: one per merchant ---
+    # --- Stores: one per merchant, each with a varied opening time ---
     stores = []
     for i, merchant in enumerate(merchants):
         store = Store(
@@ -82,6 +97,7 @@ try:
             latitude=-0.95 + random.uniform(-0.05, 0.05),   # roughly around Padang
             longitude=100.35 + random.uniform(-0.05, 0.05),
             category=random.choice(CATEGORIES),
+            opening_time=random_opening_time(),
         )
         db.add(store)
         stores.append(store)
@@ -121,19 +137,14 @@ try:
 
     db.flush()
 
-    # --- Reservations + Transactions: random customers claim random boxes ---
-    n_reservations = min(30, len(boxes) * 2)
-    for _ in range(n_reservations):
-        box = random.choice(boxes)
-        customer = random.choice(customers)
-
+    def create_reservation_and_transaction(box, customer, claimed_at):
         reservation = Reservation(
             mysterybox_id=box.id,
             user_id=customer.id,
             qr_code=random_qr_code(),
             status="claimed",
-            reserved_at=datetime.utcnow() - timedelta(hours=random.randint(1, 48)),
-            claimed_at=datetime.utcnow() - timedelta(hours=random.randint(0, 1)),
+            reserved_at=claimed_at - timedelta(minutes=random.randint(5, 60)),
+            claimed_at=claimed_at,
         )
         db.add(reservation)
         db.flush()  # get reservation.id
@@ -145,12 +156,33 @@ try:
             status="paid",
         ))
 
-        # Update the customer's EcoTracker to reflect this claim
         tracker = db.query(EcoTracker).filter_by(user_id=customer.id).first()
         savings = box.original_price - box.discounted_price
         tracker.total_savings = float(tracker.total_savings) + float(savings)
         tracker.total_co2_saved = float(tracker.total_co2_saved) + round(random.uniform(0.5, 2.0), 2)
         tracker.boxes_claimed += 1
+
+    total_reservations = 0
+
+    # --- Guaranteed reservations: every store gets some claimed 'yesterday' ---
+    # This ensures previous_sales is never 0 for every store right after a
+    # fresh seed, instead of depending on random luck to land in that window.
+    for store in stores:
+        store_boxes = [b for b in boxes if b.store_id == store.id]
+        for _ in range(GUARANTEED_YESTERDAY_RESERVATIONS_PER_STORE):
+            box = random.choice(store_boxes)
+            customer = random.choice(customers)
+            create_reservation_and_transaction(box, customer, yesterday_random_time())
+            total_reservations += 1
+
+    # --- Additional random reservations across the last few days, for variety ---
+    n_extra_reservations = min(20, len(boxes) * 2)
+    for _ in range(n_extra_reservations):
+        box = random.choice(boxes)
+        customer = random.choice(customers)
+        claimed_at = datetime.utcnow() - timedelta(hours=random.randint(1, 96))
+        create_reservation_and_transaction(box, customer, claimed_at)
+        total_reservations += 1
 
     # --- Stock predictions: one per store, using the stub model ---
     for store in stores:
@@ -163,8 +195,10 @@ try:
 
     db.commit()
     print(f"Seeded: {len(merchants)} merchants, {len(customers)} customers, "
-          f"{len(stores)} stores, {len(boxes)} mystery boxes, "
-          f"{n_reservations} reservations with transactions, "
+          f"{len(stores)} stores (each with a varied opening_time), "
+          f"{len(boxes)} mystery boxes, "
+          f"{total_reservations} reservations with transactions "
+          f"({GUARANTEED_YESTERDAY_RESERVATIONS_PER_STORE} per store guaranteed 'yesterday'), "
           f"{len(customers)} eco-tracker records, {len(stores)} stock predictions.")
 
 except Exception as e:

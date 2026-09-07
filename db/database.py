@@ -13,7 +13,8 @@ DB_NAME = os.getenv("DB_NAME")
 
 if not all([DB_USER, DB_PASSWORD, DB_NAME]):
     raise RuntimeError(
-        "CHECK YOUR ENV FILE FUCKERS"
+        "Missing required database environment variables. "
+        "Check that DB_USER, DB_PASSWORD, and DB_NAME are set in your .env file."
     )
 
 DATABASE_URL = (
