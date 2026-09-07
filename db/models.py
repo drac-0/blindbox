@@ -43,7 +43,6 @@ class Store(Base):
     category = Column(String(50))
     opening_time = Column(Time, nullable=False, default=time(8, 0))  # NEW
     created_at = Column(DateTime, default=datetime.utcnow)
-    ...
 
     owner = relationship("User", back_populates="store")
     mystery_boxes = relationship("MysteryBox", back_populates="store")

@@ -56,35 +56,39 @@ def compute_open_time_hours(opening_time) -> float:
 
 def compute_previous_sales(db: Session, store_id: int) -> float:
     """
-    Approximates 'previous day's sales' as the number of claimed
-    reservations, for this store's mystery boxes, from the previous
-    calendar day. Returns 0 if there's no history yet.
-    """
-    yesterday_start = (datetime.utcnow() - timedelta(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    yesterday_end = yesterday_start + timedelta(days=1)
+    Average daily sales (claimed reservations) for this store over the
+    last 7 days, ending yesterday (today is excluded since it's still
+    in progress and would understate the average).
 
-    count = (
+    Returns 0 if there's no history yet in that window.
+    """
+    window_end = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    window_start = window_end - timedelta(days=7)
+
+    total_claimed = (
         db.query(func.count(Reservation.id))
         .join(MysteryBox, Reservation.mysterybox_id == MysteryBox.id)
         .filter(
             MysteryBox.store_id == store_id,
             Reservation.status == "claimed",
-            Reservation.claimed_at >= yesterday_start,
-            Reservation.claimed_at < yesterday_end,
+            Reservation.claimed_at >= window_start,
+            Reservation.claimed_at < window_end,
         )
         .scalar()
     )
-    return float(count or 0)
+    total_claimed = total_claimed or 0
+
+    average_per_day = total_claimed / 7
+    return round(average_per_day, 2)
 
 
 @app.get("/predict-stock/{store_id}")
 async def predict_stock(store_id: int, db: Session = Depends(get_db)):
     """
     Computes real features from the database (hours open today,
-    previous day's claimed reservations), calls the ML service for a
-    prediction, saves the result to stockpredictions, and returns it.
+    average daily sales over the last 7 days), calls the ML service
+    for a prediction, saves the result to stockpredictions, and
+    returns it.
     """
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
