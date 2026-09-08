@@ -17,7 +17,7 @@ from sqlalchemy import text, func
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import Store, Reservation, MysteryBox, StockPrediction
+from models import Store, Reservation, MysteryBox, StockPrediction, EcoTracker, User
 
 load_dotenv()
 
@@ -133,3 +133,36 @@ async def predict_stock(store_id: int, db: Session = Depends(get_db)):
         "previous_sales_used": previous_sales,
         "day_used": day,
     }
+
+
+@app.get("/eco-tracker/{user_id}")
+def get_eco_tracker(user_id: int, db: Session = Depends(get_db)):
+    """
+    Returns a user's accumulated EcoTracker stats: total money saved,
+    total CO2 saved, and number of boxes claimed.
+ 
+    If the user exists but has no EcoTracker row yet (e.g. a brand new
+    user who hasn't claimed anything), returns zeros instead of a 404
+    so the app doesn't need special-case error handling for new users.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+ 
+    tracker = db.query(EcoTracker).filter(EcoTracker.user_id == user_id).first()
+ 
+    if not tracker:
+        return {
+            "user_id": user_id,
+            "total_savings": 0,
+            "total_co2_saved": 0,
+            "boxes_claimed": 0,
+        }
+ 
+    return {
+        "user_id": user_id,
+        "total_savings": float(tracker.total_savings),
+        "total_co2_saved": float(tracker.total_co2_saved),
+        "boxes_claimed": tracker.boxes_claimed,
+    }
+
