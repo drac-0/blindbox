@@ -3,7 +3,9 @@ seed.py
 
 Creates all tables (if they don't exist) and fills the database with
 synthetic data across every table in the schema: users, stores,
-mysteryboxes, reservations, transactions, ecotracker, stockpredictions.
+mysteryboxes (now used to represent real, visible food/beverage items
+rather than hidden "mystery" boxes), reservations, transactions,
+ecotracker, stockpredictions.
 
 This is FAKE data for testing purposes only. Run once against a fresh
 database:
@@ -41,6 +43,31 @@ CUSTOMER_NAMES = [
     "Indah", "Joko", "Kartika", "Lina", "Made", "Nia", "Oki", "Putri",
     "Rian", "Sari", "Tono", "Umi",
 ]
+
+# Real, visible items per store category — no more generic "Mystery Box" naming
+ITEMS_BY_CATEGORY = {
+    "Bakery": [
+        ("Croissant Coklat", "Croissant renyah dengan isian coklat lumer"),
+        ("Roti Sobek Keju", "Roti empuk dengan taburan keju di atasnya"),
+        ("Donat Gula", "Donat klasik bertabur gula halus"),
+        ("Kue Lapis Legit", "Kue lapis dengan rempah khas, dipotong per slice"),
+        ("Brownies Panggang", "Brownies coklat padat, dipanggang hari ini"),
+    ],
+    "Cafe": [
+        ("Es Kopi Susu", "Kopi susu dingin, sisa seduhan hari ini"),
+        ("Cappuccino", "Cappuccino dengan foam lembut"),
+        ("Croffle Original", "Croissant waffle renyah, disajikan hangat"),
+        ("Sandwich Panggang", "Sandwich isi telur dan sayur, dipanggang"),
+        ("Kue Cubit Coklat", "Kue cubit lembut dengan topping coklat"),
+    ],
+    "Restaurant": [
+        ("Nasi Goreng Spesial", "Nasi goreng dengan telur dan ayam suwir"),
+        ("Ayam Geprek", "Ayam goreng geprek dengan sambal bawang"),
+        ("Mie Ayam", "Mie ayam dengan pangsit dan bakso"),
+        ("Rendang Nasi Padang", "Nasi padang dengan rendang daging sapi"),
+        ("Sate Ayam", "Sate ayam dengan bumbu kacang, per porsi"),
+    ],
+}
 
 
 def random_qr_code():
@@ -104,16 +131,18 @@ try:
 
     db.flush()
 
-    # --- Mystery boxes: a few per store ---
+    # --- Items (mysteryboxes table): real food/beverage names per store category ---
     boxes = []
     for store in stores:
+        item_pool = ITEMS_BY_CATEGORY[store.category]
         for _ in range(BOXES_PER_STORE):
-            original_price = round(random.uniform(20000, 80000), -2)  # rupiah-ish
+            item_name, item_description = random.choice(item_pool)
+            original_price = round(random.uniform(15000, 60000), -2)  # rupiah-ish
             discount = random.choice([0.3, 0.4, 0.5])
             box = MysteryBox(
                 store_id=store.id,
-                title=f"Mystery Box {store.name}",
-                description="Paket kejutan sisa makanan hari ini",
+                title=item_name,
+                description=item_description,
                 original_price=original_price,
                 discounted_price=round(original_price * (1 - discount), -2),
                 quantity=random.randint(1, 10),
@@ -165,8 +194,6 @@ try:
     total_reservations = 0
 
     # --- Guaranteed reservations: every store gets some claimed 'yesterday' ---
-    # This ensures previous_sales is never 0 for every store right after a
-    # fresh seed, instead of depending on random luck to land in that window.
     for store in stores:
         store_boxes = [b for b in boxes if b.store_id == store.id]
         for _ in range(GUARANTEED_YESTERDAY_RESERVATIONS_PER_STORE):
@@ -196,7 +223,7 @@ try:
     db.commit()
     print(f"Seeded: {len(merchants)} merchants, {len(customers)} customers, "
           f"{len(stores)} stores (each with a varied opening_time), "
-          f"{len(boxes)} mystery boxes, "
+          f"{len(boxes)} real food/beverage items, "
           f"{total_reservations} reservations with transactions "
           f"({GUARANTEED_YESTERDAY_RESERVATIONS_PER_STORE} per store guaranteed 'yesterday'), "
           f"{len(customers)} eco-tracker records, {len(stores)} stock predictions.")

@@ -3,18 +3,20 @@ main.py
 
 FastAPI entrypoint for the BlindBox Eco backend.
 Handles: DB session wiring, health check, register/login,
-SmartStock prediction, EcoTracker stats, and QuickClaim
-(reservation creation + pickup redemption).
+item listing + detail (Home/Explore), SmartStock prediction,
+EcoTracker stats, and QuickClaim (reservation + pickup redemption).
 """
 
+import math
 import os
 import random
 import string
 from datetime import datetime, timedelta
+from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError
 from sqlalchemy import text, func, update
@@ -36,9 +38,11 @@ app = FastAPI(title="BlindBox Eco API")
 
 bearer_scheme = HTTPBearer()
 
+
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    db: Session = Depends(get_db),) -> User:
+    db: Session = Depends(get_db),
+) -> User:
     token = credentials.credentials
     try:
         payload = decode_access_token(token)
@@ -103,6 +107,109 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
     token = create_access_token(user_id=user.id, role=user.role)
     return AuthResponse(access_token=token, user_id=user.id, name=user.name, role=user.role)
+
+
+def haversine_km(lat1, lon1, lat2, lon2) -> float:
+    """Great-circle distance between two lat/lng points, in kilometers."""
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _serialize_item(box: MysteryBox, store: Store, user_lat: Optional[float], user_lng: Optional[float]) -> dict:
+    distance_km = None
+    if user_lat is not None and user_lng is not None and store.latitude is not None and store.longitude is not None:
+        distance_km = round(haversine_km(user_lat, user_lng, store.latitude, store.longitude), 2)
+
+    minutes_left = None
+    now = datetime.utcnow()
+    if box.pickup_end > now:
+        minutes_left = int((box.pickup_end - now).total_seconds() / 60)
+
+    return {
+        "item_id": box.id,
+        "title": box.title,
+        "description": box.description,
+        "original_price": float(box.original_price),
+        "discounted_price": float(box.discounted_price),
+        "quantity_available": box.quantity,
+        "pickup_start": box.pickup_start,
+        "pickup_end": box.pickup_end,
+        "minutes_left": minutes_left,
+        "store": {
+            "store_id": store.id,
+            "name": store.name,
+            "address": store.address,
+            "category": store.category,
+            "latitude": store.latitude,
+            "longitude": store.longitude,
+        },
+        "distance_km": distance_km,
+    }
+
+
+@app.get("/items")
+def list_items(
+    lat: Optional[float] = Query(None, description="User's current latitude, for distance sorting"),
+    lng: Optional[float] = Query(None, description="User's current longitude, for distance sorting"),
+    db: Session = Depends(get_db),
+):
+    """
+    Lists all currently available items (Home/Explore screens).
+    Only returns items that are still purchasable: status 'available',
+    quantity > 0, and pickup window not yet ended.
+
+    If lat/lng are provided, results are sorted nearest-first and each
+    item includes distance_km. Without them, results are unsorted by
+    distance (still returned, just no distance field).
+    """
+    now = datetime.utcnow()
+    boxes = (
+        db.query(MysteryBox)
+        .filter(
+            MysteryBox.status == "available",
+            MysteryBox.quantity > 0,
+            MysteryBox.pickup_end > now,
+        )
+        .all()
+    )
+
+    items = []
+    for box in boxes:
+        store = db.query(Store).filter(Store.id == box.store_id).first()
+        if not store:
+            continue
+        items.append(_serialize_item(box, store, lat, lng))
+
+    if lat is not None and lng is not None:
+        items.sort(key=lambda i: (i["distance_km"] if i["distance_km"] is not None else float("inf")))
+
+    return {"count": len(items), "items": items}
+
+
+@app.get("/items/{item_id}")
+def get_item(
+    item_id: int,
+    lat: Optional[float] = Query(None),
+    lng: Optional[float] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Detail view for a single item (the 'Detail Cafe' screen) — full
+    description, store info, quantity left, and time remaining.
+    """
+    box = db.query(MysteryBox).filter(MysteryBox.id == item_id).first()
+    if not box:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    store = db.query(Store).filter(Store.id == box.store_id).first()
+    if not store:
+        raise HTTPException(status_code=404, detail="Store for this item not found")
+
+    return _serialize_item(box, store, lat, lng)
 
 
 def compute_open_time_hours(opening_time) -> float:
@@ -217,26 +324,16 @@ def create_reservation(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    Creates a reservation for a mystery box (QuickClaim's "instant
-    reservation" step). Quantity is decremented atomically in a single
-    UPDATE statement guarded by `quantity > 0`, so two simultaneous
-    requests for the last unit can't both succeed — the database
-    itself serializes concurrent writes to the same row, and only one
-    UPDATE will actually match and decrement; the other gets rowcount
-    0 and is rejected.
-    """
     box = db.query(MysteryBox).filter(MysteryBox.id == payload.mysterybox_id).first()
     if not box:
-        raise HTTPException(status_code=404, detail="Mystery box not found")
+        raise HTTPException(status_code=404, detail="Item not found")
 
     if box.status != "available":
-        raise HTTPException(status_code=409, detail="This mystery box is no longer available")
+        raise HTTPException(status_code=409, detail="This item is no longer available")
 
     if datetime.utcnow() > box.pickup_end:
-        raise HTTPException(status_code=409, detail="This mystery box's pickup window has ended")
+        raise HTTPException(status_code=409, detail="This item's pickup window has ended")
 
-    # Atomic check-and-decrement: prevents double-claiming the last unit
     result = db.execute(
         update(MysteryBox)
         .where(MysteryBox.id == box.id, MysteryBox.quantity > 0)
@@ -244,7 +341,7 @@ def create_reservation(
     )
     if result.rowcount == 0:
         db.rollback()
-        raise HTTPException(status_code=409, detail="This mystery box just sold out")
+        raise HTTPException(status_code=409, detail="This item just sold out")
 
     reservation = Reservation(
         mysterybox_id=box.id,
@@ -254,7 +351,7 @@ def create_reservation(
         reserved_at=datetime.utcnow(),
     )
     db.add(reservation)
-    db.flush()  # get reservation.id
+    db.flush()
 
     db.add(Transaction(
         reservation_id=reservation.id,
@@ -278,15 +375,6 @@ def create_reservation(
 
 @app.post("/reservations/claim", response_model=ClaimResponse)
 def claim_reservation(payload: ClaimRequest, db: Session = Depends(get_db)):
-    """
-    Redeems a reservation at pickup by scanning its QR code
-    (QuickClaim's "penukaran pesanan via kode QR" step). Marks the
-    reservation as claimed and updates the customer's EcoTracker.
-
-    No auth required here deliberately — this is meant to be called
-    from the merchant's side scanning the customer's QR code, not
-    from the customer's own logged-in session.
-    """
     reservation = db.query(Reservation).filter(Reservation.qr_code == payload.qr_code).first()
     if not reservation:
         raise HTTPException(status_code=404, detail="Invalid QR code")
@@ -307,8 +395,6 @@ def claim_reservation(payload: ClaimRequest, db: Session = Depends(get_db)):
         savings = float(box.original_price) - float(box.discounted_price)
         tracker.total_savings = float(tracker.total_savings) + savings
         tracker.boxes_claimed += 1
-        # total_co2_saved intentionally left untouched here — no real
-        # calculation exists yet (known gap, flagged earlier)
 
     db.commit()
     db.refresh(reservation)
