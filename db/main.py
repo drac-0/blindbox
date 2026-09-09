@@ -3,10 +3,13 @@ main.py
 
 FastAPI entrypoint for the BlindBox Eco backend.
 Handles: DB session wiring, health check, register/login,
-SmartStock prediction flow, and EcoTracker stats.
+SmartStock prediction, EcoTracker stats, and QuickClaim
+(reservation creation + pickup redemption).
 """
 
 import os
+import random
+import string
 from datetime import datetime, timedelta
 
 import httpx
@@ -14,12 +17,15 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError
-from sqlalchemy import text, func
+from sqlalchemy import text, func, update
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import Store, Reservation, MysteryBox, StockPrediction, EcoTracker, User
-from Schemas import RegisterRequest, LoginRequest, AuthResponse
+from models import Store, Reservation, MysteryBox, StockPrediction, EcoTracker, User, Transaction
+from Schemas import (
+    RegisterRequest, LoginRequest, AuthResponse,
+    ReservationCreateRequest, ReservationResponse, ClaimRequest, ClaimResponse,
+)
 from Auth import hash_password, verify_password, create_access_token, decode_access_token
 
 load_dotenv()
@@ -30,16 +36,9 @@ app = FastAPI(title="BlindBox Eco API")
 
 bearer_scheme = HTTPBearer()
 
-
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    db: Session = Depends(get_db),
-) -> User:
-    """
-    Reads the JWT from the Authorization header (Bearer <token>),
-    decodes it, and returns the matching User. Raises 401 if the
-    token is missing, invalid, expired, or the user no longer exists.
-    """
+    db: Session = Depends(get_db),) -> User:
     token = credentials.credentials
     try:
         payload = decode_access_token(token)
@@ -197,21 +196,126 @@ def get_my_eco_tracker(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    Returns the logged-in user's EcoTracker stats, identified from
-    their JWT token — no user_id needed in the URL or tracked
-    manually by the app.
-    """
     return _eco_tracker_response(current_user.id, db)
 
 
 @app.get("/eco-tracker/{user_id}")
 def get_eco_tracker(user_id: int, db: Session = Depends(get_db)):
-    """
-    Kept for backend/admin use. The mobile app should use
-    GET /eco-tracker/me instead.
-    """
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail=f"User {user_id} not found")
     return _eco_tracker_response(user_id, db)
+
+
+def _random_qr_code() -> str:
+    return "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
+
+
+@app.post("/reservations", response_model=ReservationResponse)
+def create_reservation(
+    payload: ReservationCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Creates a reservation for a mystery box (QuickClaim's "instant
+    reservation" step). Quantity is decremented atomically in a single
+    UPDATE statement guarded by `quantity > 0`, so two simultaneous
+    requests for the last unit can't both succeed — the database
+    itself serializes concurrent writes to the same row, and only one
+    UPDATE will actually match and decrement; the other gets rowcount
+    0 and is rejected.
+    """
+    box = db.query(MysteryBox).filter(MysteryBox.id == payload.mysterybox_id).first()
+    if not box:
+        raise HTTPException(status_code=404, detail="Mystery box not found")
+
+    if box.status != "available":
+        raise HTTPException(status_code=409, detail="This mystery box is no longer available")
+
+    if datetime.utcnow() > box.pickup_end:
+        raise HTTPException(status_code=409, detail="This mystery box's pickup window has ended")
+
+    # Atomic check-and-decrement: prevents double-claiming the last unit
+    result = db.execute(
+        update(MysteryBox)
+        .where(MysteryBox.id == box.id, MysteryBox.quantity > 0)
+        .values(quantity=MysteryBox.quantity - 1)
+    )
+    if result.rowcount == 0:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="This mystery box just sold out")
+
+    reservation = Reservation(
+        mysterybox_id=box.id,
+        user_id=current_user.id,
+        qr_code=_random_qr_code(),
+        status="pending",
+        reserved_at=datetime.utcnow(),
+    )
+    db.add(reservation)
+    db.flush()  # get reservation.id
+
+    db.add(Transaction(
+        reservation_id=reservation.id,
+        amount=box.discounted_price,
+        method="app",
+        status="paid",
+    ))
+
+    db.commit()
+    db.refresh(reservation)
+
+    return ReservationResponse(
+        reservation_id=reservation.id,
+        mysterybox_id=box.id,
+        qr_code=reservation.qr_code,
+        status=reservation.status,
+        reserved_at=reservation.reserved_at,
+        amount=float(box.discounted_price),
+    )
+
+
+@app.post("/reservations/claim", response_model=ClaimResponse)
+def claim_reservation(payload: ClaimRequest, db: Session = Depends(get_db)):
+    """
+    Redeems a reservation at pickup by scanning its QR code
+    (QuickClaim's "penukaran pesanan via kode QR" step). Marks the
+    reservation as claimed and updates the customer's EcoTracker.
+
+    No auth required here deliberately — this is meant to be called
+    from the merchant's side scanning the customer's QR code, not
+    from the customer's own logged-in session.
+    """
+    reservation = db.query(Reservation).filter(Reservation.qr_code == payload.qr_code).first()
+    if not reservation:
+        raise HTTPException(status_code=404, detail="Invalid QR code")
+
+    if reservation.status == "claimed":
+        raise HTTPException(status_code=409, detail="This reservation was already claimed")
+
+    if reservation.status == "expired":
+        raise HTTPException(status_code=409, detail="This reservation has expired")
+
+    box = db.query(MysteryBox).filter(MysteryBox.id == reservation.mysterybox_id).first()
+
+    reservation.status = "claimed"
+    reservation.claimed_at = datetime.utcnow()
+
+    tracker = db.query(EcoTracker).filter(EcoTracker.user_id == reservation.user_id).first()
+    if tracker and box:
+        savings = float(box.original_price) - float(box.discounted_price)
+        tracker.total_savings = float(tracker.total_savings) + savings
+        tracker.boxes_claimed += 1
+        # total_co2_saved intentionally left untouched here — no real
+        # calculation exists yet (known gap, flagged earlier)
+
+    db.commit()
+    db.refresh(reservation)
+
+    return ClaimResponse(
+        reservation_id=reservation.id,
+        status=reservation.status,
+        claimed_at=reservation.claimed_at,
+        message="Reservation successfully claimed",
+    )
