@@ -12,19 +12,46 @@ from datetime import datetime, timedelta
 import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import JWTError
 from sqlalchemy import text, func
 from sqlalchemy.orm import Session
 
 from database import get_db
 from models import Store, Reservation, MysteryBox, StockPrediction, EcoTracker, User
 from Schemas import RegisterRequest, LoginRequest, AuthResponse
-from Auth import hash_password, verify_password, create_access_token
+from Auth import hash_password, verify_password, create_access_token, decode_access_token
 
 load_dotenv()
 
 ML_SERVICE_URL = os.getenv("ML_SERVICE_URL", "http://localhost:8001")
 
 app = FastAPI(title="BlindBox Eco API")
+
+bearer_scheme = HTTPBearer()
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> User:
+    """
+    Reads the JWT from the Authorization header (Bearer <token>),
+    decodes it, and returns the matching User. Raises 401 if the
+    token is missing, invalid, expired, or the user no longer exists.
+    """
+    token = credentials.credentials
+    try:
+        payload = decode_access_token(token)
+        user_id = int(payload.get("sub"))
+    except (JWTError, TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User no longer exists")
+
+    return user
 
 
 @app.get("/")
@@ -57,9 +84,8 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
         role=payload.role,
     )
     db.add(user)
-    db.flush()  # get user.id before commit
+    db.flush()
 
-    # Customers get an EcoTracker row right away, same as seeded users
     if payload.role == "customer":
         db.add(EcoTracker(user_id=user.id, total_savings=0, total_co2_saved=0, boxes_claimed=0))
 
@@ -74,8 +100,6 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == payload.email).first()
     if not user or not verify_password(payload.password, user.password_hash):
-        # Same error for "no such user" and "wrong password" —
-        # avoids revealing whether an email is registered
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     token = create_access_token(user_id=user.id, role=user.role)
@@ -156,20 +180,38 @@ async def predict_stock(store_id: int, db: Session = Depends(get_db)):
     }
 
 
-@app.get("/eco-tracker/{user_id}")
-def get_eco_tracker(user_id: int, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
-
+def _eco_tracker_response(user_id: int, db: Session):
     tracker = db.query(EcoTracker).filter(EcoTracker.user_id == user_id).first()
-
     if not tracker:
         return {"user_id": user_id, "total_savings": 0, "total_co2_saved": 0, "boxes_claimed": 0}
-
     return {
         "user_id": user_id,
         "total_savings": float(tracker.total_savings),
         "total_co2_saved": float(tracker.total_co2_saved),
         "boxes_claimed": tracker.boxes_claimed,
     }
+
+
+@app.get("/eco-tracker/me")
+def get_my_eco_tracker(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Returns the logged-in user's EcoTracker stats, identified from
+    their JWT token — no user_id needed in the URL or tracked
+    manually by the app.
+    """
+    return _eco_tracker_response(current_user.id, db)
+
+
+@app.get("/eco-tracker/{user_id}")
+def get_eco_tracker(user_id: int, db: Session = Depends(get_db)):
+    """
+    Kept for backend/admin use. The mobile app should use
+    GET /eco-tracker/me instead.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+    return _eco_tracker_response(user_id, db)
