@@ -8,7 +8,6 @@ app = FastAPI(title="BlindBox Eco ML Service")
 
 model = SmartStockModel(csv_path="smartstock_synthetic_data.csv")
 
-
 @app.get("/")
 def read_root():
     return {"status": "ok"}
