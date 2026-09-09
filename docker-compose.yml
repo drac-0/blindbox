@@ -9,8 +9,6 @@ services:
       MYSQL_PASSWORD: ${DB_PASSWORD}
     volumes:
       - mysql_data:/var/lib/mysql
-    ports:
-      - "3306:3306"
 
   ml:
     build: ./ml
