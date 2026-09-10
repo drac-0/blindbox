@@ -3,8 +3,13 @@ main.py
 
 FastAPI entrypoint for the BlindBox Eco backend.
 Handles: DB session wiring, health check, register/login,
-item listing + detail (Home/Explore), SmartStock prediction,
-EcoTracker stats, and QuickClaim (reservation + pickup redemption).
+item listing + detail, SmartStock prediction, EcoTracker
+(read + update), and QuickClaim (reservation + pickup redemption).
+
+Note on payment: there is no payment gateway integration. A
+successful reservation IS the "payment" — it immediately records the
+money saved and estimated CO2 saved into the user's EcoTracker. No
+separate Transaction/payment step exists.
 """
 
 import math
@@ -23,12 +28,14 @@ from sqlalchemy import text, func, update
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import Store, Reservation, MysteryBox, StockPrediction, EcoTracker, User, Transaction
+from models import Store, Reservation, MysteryBox, StockPrediction, EcoTracker, User
 from Schemas import (
     RegisterRequest, LoginRequest, AuthResponse,
     ReservationCreateRequest, ReservationResponse, ClaimRequest, ClaimResponse,
+    EcoTrackerUpdateRequest, EcoTrackerResponse, PredictionResponse,
 )
 from Auth import hash_password, verify_password, create_access_token, decode_access_token
+from food_data import estimate_co2_saved_kg
 
 load_dotenv()
 
@@ -110,7 +117,6 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
 
 def haversine_km(lat1, lon1, lat2, lon2) -> float:
-    """Great-circle distance between two lat/lng points, in kilometers."""
     R = 6371.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     d_phi = math.radians(lat2 - lat1)
@@ -133,6 +139,7 @@ def _serialize_item(box: MysteryBox, store: Store, user_lat: Optional[float], us
         "item_id": box.id,
         "title": box.title,
         "description": box.description,
+        "image_url": box.image_url,
         "original_price": float(box.original_price),
         "discounted_price": float(box.discounted_price),
         "quantity_available": box.quantity,
@@ -153,19 +160,10 @@ def _serialize_item(box: MysteryBox, store: Store, user_lat: Optional[float], us
 
 @app.get("/items")
 def list_items(
-    lat: Optional[float] = Query(None, description="User's current latitude, for distance sorting"),
-    lng: Optional[float] = Query(None, description="User's current longitude, for distance sorting"),
+    lat: Optional[float] = Query(None),
+    lng: Optional[float] = Query(None),
     db: Session = Depends(get_db),
 ):
-    """
-    Lists all currently available items (Home/Explore screens).
-    Only returns items that are still purchasable: status 'available',
-    quantity > 0, and pickup window not yet ended.
-
-    If lat/lng are provided, results are sorted nearest-first and each
-    item includes distance_km. Without them, results are unsorted by
-    distance (still returned, just no distance field).
-    """
     now = datetime.utcnow()
     boxes = (
         db.query(MysteryBox)
@@ -197,10 +195,6 @@ def get_item(
     lng: Optional[float] = Query(None),
     db: Session = Depends(get_db),
 ):
-    """
-    Detail view for a single item (the 'Detail Cafe' screen) — full
-    description, store info, quantity left, and time remaining.
-    """
     box = db.query(MysteryBox).filter(MysteryBox.id == item_id).first()
     if not box:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -240,8 +234,14 @@ def compute_previous_sales(db: Session, store_id: int) -> float:
     return round(total_claimed / 7, 2)
 
 
-@app.get("/predict-stock/{store_id}")
+@app.get("/predict-stock/{store_id}", response_model=PredictionResponse)
 async def predict_stock(store_id: int, db: Session = Depends(get_db)):
+    """
+    Returns just the prediction — store_id and predicted_quantity.
+    Internally still computes real features (open_time_hours,
+    previous_sales, day) and saves the full prediction record to
+    stockpredictions, but those inputs aren't part of the response.
+    """
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail=f"Store {store_id} not found")
@@ -278,27 +278,22 @@ async def predict_stock(store_id: int, db: Session = Depends(get_db)):
     db.add(prediction_record)
     db.commit()
 
-    return {
-        **result,
-        "open_time_hours_used": open_time_hours,
-        "previous_sales_used": previous_sales,
-        "day_used": day,
-    }
+    return PredictionResponse(store_id=store_id, predicted_quantity=result["predicted_quantity"])
 
 
-def _eco_tracker_response(user_id: int, db: Session):
+def _eco_tracker_response(user_id: int, db: Session) -> EcoTrackerResponse:
     tracker = db.query(EcoTracker).filter(EcoTracker.user_id == user_id).first()
     if not tracker:
-        return {"user_id": user_id, "total_savings": 0, "total_co2_saved": 0, "boxes_claimed": 0}
-    return {
-        "user_id": user_id,
-        "total_savings": float(tracker.total_savings),
-        "total_co2_saved": float(tracker.total_co2_saved),
-        "boxes_claimed": tracker.boxes_claimed,
-    }
+        return EcoTrackerResponse(user_id=user_id, total_savings=0, total_co2_saved=0, boxes_claimed=0)
+    return EcoTrackerResponse(
+        user_id=user_id,
+        total_savings=float(tracker.total_savings),
+        total_co2_saved=float(tracker.total_co2_saved),
+        boxes_claimed=tracker.boxes_claimed,
+    )
 
 
-@app.get("/eco-tracker/me")
+@app.get("/eco-tracker/me", response_model=EcoTrackerResponse)
 def get_my_eco_tracker(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -306,7 +301,30 @@ def get_my_eco_tracker(
     return _eco_tracker_response(current_user.id, db)
 
 
-@app.get("/eco-tracker/{user_id}")
+@app.patch("/eco-tracker/me", response_model=EcoTrackerResponse)
+def update_my_eco_tracker(
+    payload: EcoTrackerUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    tracker = db.query(EcoTracker).filter(EcoTracker.user_id == current_user.id).first()
+
+    if not tracker:
+        tracker = EcoTracker(user_id=current_user.id, total_savings=0, total_co2_saved=0, boxes_claimed=0)
+        db.add(tracker)
+        db.flush()
+
+    tracker.total_savings = float(tracker.total_savings) + (payload.savings_delta or 0)
+    tracker.total_co2_saved = float(tracker.total_co2_saved) + (payload.co2_delta or 0)
+    tracker.boxes_claimed = tracker.boxes_claimed + (payload.boxes_delta or 0)
+
+    db.commit()
+    db.refresh(tracker)
+
+    return _eco_tracker_response(current_user.id, db)
+
+
+@app.get("/eco-tracker/{user_id}", response_model=EcoTrackerResponse)
 def get_eco_tracker(user_id: int, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
@@ -324,6 +342,15 @@ def create_reservation(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """
+    Creates a reservation. There is no payment gateway — a successful
+    reservation itself acts as the "payment": it immediately updates
+    the user's EcoTracker with the money saved (original_price -
+    discounted_price) and an estimated CO2 saved figure based on the
+    item's estimated weight. boxes_claimed is also incremented here,
+    at reservation time, not at pickup — reserving IS the completed
+    action in this flow, not a separate pending step.
+    """
     box = db.query(MysteryBox).filter(MysteryBox.id == payload.mysterybox_id).first()
     if not box:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -334,6 +361,7 @@ def create_reservation(
     if datetime.utcnow() > box.pickup_end:
         raise HTTPException(status_code=409, detail="This item's pickup window has ended")
 
+    # Atomic check-and-decrement: prevents double-claiming the last unit
     result = db.execute(
         update(MysteryBox)
         .where(MysteryBox.id == box.id, MysteryBox.quantity > 0)
@@ -347,18 +375,24 @@ def create_reservation(
         mysterybox_id=box.id,
         user_id=current_user.id,
         qr_code=_random_qr_code(),
-        status="pending",
+        status="pending",  # still awaiting physical pickup/QR redemption
         reserved_at=datetime.utcnow(),
     )
     db.add(reservation)
     db.flush()
 
-    db.add(Transaction(
-        reservation_id=reservation.id,
-        amount=box.discounted_price,
-        method="app",
-        status="paid",
-    ))
+    savings = float(box.original_price) - float(box.discounted_price)
+    co2_saved = estimate_co2_saved_kg(box.title)
+
+    tracker = db.query(EcoTracker).filter(EcoTracker.user_id == current_user.id).first()
+    if not tracker:
+        tracker = EcoTracker(user_id=current_user.id, total_savings=0, total_co2_saved=0, boxes_claimed=0)
+        db.add(tracker)
+        db.flush()
+
+    tracker.total_savings = float(tracker.total_savings) + savings
+    tracker.total_co2_saved = float(tracker.total_co2_saved) + co2_saved
+    tracker.boxes_claimed += 1
 
     db.commit()
     db.refresh(reservation)
@@ -370,11 +404,18 @@ def create_reservation(
         status=reservation.status,
         reserved_at=reservation.reserved_at,
         amount=float(box.discounted_price),
+        co2_saved_kg=co2_saved,
     )
 
 
 @app.post("/reservations/claim", response_model=ClaimResponse)
 def claim_reservation(payload: ClaimRequest, db: Session = Depends(get_db)):
+    """
+    Marks a reservation as physically picked up (QR scanned at the
+    store). EcoTracker is NOT updated here anymore — that already
+    happened at reservation time, since reserving now acts as the
+    "payment" step. This endpoint only tracks pickup completion.
+    """
     reservation = db.query(Reservation).filter(Reservation.qr_code == payload.qr_code).first()
     if not reservation:
         raise HTTPException(status_code=404, detail="Invalid QR code")
@@ -385,16 +426,8 @@ def claim_reservation(payload: ClaimRequest, db: Session = Depends(get_db)):
     if reservation.status == "expired":
         raise HTTPException(status_code=409, detail="This reservation has expired")
 
-    box = db.query(MysteryBox).filter(MysteryBox.id == reservation.mysterybox_id).first()
-
     reservation.status = "claimed"
     reservation.claimed_at = datetime.utcnow()
-
-    tracker = db.query(EcoTracker).filter(EcoTracker.user_id == reservation.user_id).first()
-    if tracker and box:
-        savings = float(box.original_price) - float(box.discounted_price)
-        tracker.total_savings = float(tracker.total_savings) + savings
-        tracker.boxes_claimed += 1
 
     db.commit()
     db.refresh(reservation)

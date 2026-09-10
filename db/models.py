@@ -66,6 +66,7 @@ class MysteryBox(Base):
 
     store = relationship("Store", back_populates="mystery_boxes")
     reservations = relationship("Reservation", back_populates="mystery_box")
+    image_url = Column(String(500))
 
 
 class Reservation(Base):
