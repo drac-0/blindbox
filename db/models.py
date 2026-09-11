@@ -23,7 +23,7 @@ class User(Base):
     name = Column(String(100), nullable=False)
     email = Column(String(150), unique=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
-    role = Column(String(20), nullable=False)  # "customer" or "merchant"
+    role = Column(String(20), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     store = relationship("Store", back_populates="owner", uselist=False)
@@ -38,10 +38,11 @@ class Store(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     name = Column(String(150), nullable=False)
     address = Column(String(255))
+    phone_number = Column(String(20))
     latitude = Column(Float)
     longitude = Column(Float)
     category = Column(String(50))
-    opening_time = Column(Time, nullable=False, default=time(8, 0))  # NEW
+    opening_time = Column(Time, nullable=False, default=time(8, 0))
     created_at = Column(DateTime, default=datetime.utcnow)
 
     owner = relationship("User", back_populates="store")
@@ -56,6 +57,7 @@ class MysteryBox(Base):
     store_id = Column(Integer, ForeignKey("stores.id"), nullable=False)
     title = Column(String(150), nullable=False)
     description = Column(String(500))
+    image_url = Column(String(500))
     original_price = Column(Numeric(10, 2), nullable=False)
     discounted_price = Column(Numeric(10, 2), nullable=False)
     quantity = Column(Integer, nullable=False)
@@ -66,7 +68,6 @@ class MysteryBox(Base):
 
     store = relationship("Store", back_populates="mystery_boxes")
     reservations = relationship("Reservation", back_populates="mystery_box")
-    image_url = Column(String(500))
 
 
 class Reservation(Base):
@@ -76,7 +77,7 @@ class Reservation(Base):
     mysterybox_id = Column(Integer, ForeignKey("mysteryboxes.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     qr_code = Column(String(64), unique=True, nullable=False)
-    status = Column(String(20), default="pending")  # pending, claimed, expired
+    status = Column(String(20), default="pending")
     reserved_at = Column(DateTime, default=datetime.utcnow)
     claimed_at = Column(DateTime, nullable=True)
 

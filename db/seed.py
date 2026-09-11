@@ -2,10 +2,9 @@
 seed.py
 
 Creates all tables (if they don't exist) and fills the database with
-synthetic data across every table in the schema: users, stores,
-mysteryboxes (now used to represent real, visible food/beverage items
-rather than hidden "mystery" boxes), reservations, transactions,
-ecotracker, stockpredictions.
+synthetic data across every table in the schema: users, stores
+(with both an address and a separate phone_number), mysteryboxes
+(real food/beverage items), reservations, ecotracker, stockpredictions.
 
 This is FAKE data for testing purposes only. Run once against a fresh
 database:
@@ -23,7 +22,6 @@ from models import (
     EcoTracker, StockPrediction,
 )
 
-# Create all tables based on models.py
 Base.metadata.create_all(bind=engine)
 
 db = SessionLocal()
@@ -32,7 +30,7 @@ db = SessionLocal()
 N_MERCHANTS = 8
 N_CUSTOMERS = 20
 BOXES_PER_STORE = 5
-GUARANTEED_YESTERDAY_RESERVATIONS_PER_STORE = 2  # ensures previous_sales is never 0 right after seeding
+GUARANTEED_YESTERDAY_RESERVATIONS_PER_STORE = 2
 CATEGORIES = ["Bakery", "Cafe", "Restaurant"]
 STORE_NAMES = [
     "Roti Segar", "Kopi Senja", "Warung Padang Berkah", "Bakery Manis",
@@ -44,7 +42,6 @@ CUSTOMER_NAMES = [
     "Rian", "Sari", "Tono", "Umi",
 ]
 
-# Real, visible items per store category — no more generic "Mystery Box" naming
 ITEMS_BY_CATEGORY = {
     "Bakery": [
         ("Croissant Coklat", "Croissant renyah dengan isian coklat lumer"),
@@ -69,14 +66,20 @@ ITEMS_BY_CATEGORY = {
     ],
 }
 
+INDONESIAN_MOBILE_PREFIXES = [
+    "811", "812", "813", "821", "822", "823",
+    "814", "815", "816", "855", "856", "857", "858",
+    "817", "818", "819", "859", "877", "878",
+    "895", "896", "897", "898", "899",
+    "881", "882", "883", "884", "885", "886", "887", "888", "889",
+]
+
 
 def random_qr_code():
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
 
 
 def random_opening_time():
-    # Varies each store's opening hour so SmartStock predictions differ
-    # meaningfully between stores instead of all using the same default.
     return time(random.randint(6, 10), random.choice([0, 15, 30, 45]))
 
 
@@ -88,14 +91,32 @@ def yesterday_random_time():
     )
 
 
+def random_indonesian_phone() -> str:
+    prefix = random.choice(INDONESIAN_MOBILE_PREFIXES)
+    part1 = f"{random.randint(0, 9999):04d}"
+    part2 = f"{random.randint(0, 9999):04d}"
+    return f"+62 {prefix}-{part1}-{part2}"
+
+
+def random_padang_address() -> str:
+    streets = [
+        "Jl. Khatib Sulaiman", "Jl. Veteran", "Jl. Sudirman",
+        "Jl. Hamka", "Jl. Ahmad Yani", "Jl. Diponegoro",
+        "Jl. Gajah Mada", "Jl. Bundo Kanduang", "Jl. Damar",
+    ]
+    street = random.choice(streets)
+    number = random.randint(1, 150)
+    return f"{street} No. {number}, Padang"
+
+
 try:
-    # --- Users: merchants + customers ---
+    # --- Users ---
     merchants = []
     for i in range(N_MERCHANTS):
         user = User(
             name=f"Merchant {i+1}",
             email=f"merchant{i+1}@example.com",
-            password_hash="fakehash",  # placeholder; real auth not built yet
+            password_hash="fakehash",
             role="merchant",
         )
         db.add(user)
@@ -112,16 +133,17 @@ try:
         db.add(user)
         customers.append(user)
 
-    db.flush()  # assigns IDs without committing yet
+    db.flush()
 
-    # --- Stores: one per merchant, each with a varied opening time ---
+    # --- Stores: real street address AND a separate phone number ---
     stores = []
     for i, merchant in enumerate(merchants):
         store = Store(
             user_id=merchant.id,
             name=STORE_NAMES[i % len(STORE_NAMES)],
-            address=f"Jl. Contoh No. {random.randint(1, 100)}, Padang",
-            latitude=-0.95 + random.uniform(-0.05, 0.05),   # roughly around Padang
+            address=random_padang_address(),
+            phone_number=random_indonesian_phone(),
+            latitude=-0.95 + random.uniform(-0.05, 0.05),
             longitude=100.35 + random.uniform(-0.05, 0.05),
             category=random.choice(CATEGORIES),
             opening_time=random_opening_time(),
@@ -131,13 +153,13 @@ try:
 
     db.flush()
 
-    # --- Items (mysteryboxes table): real food/beverage names per store category ---
+    # --- Items ---
     boxes = []
     for store in stores:
         item_pool = ITEMS_BY_CATEGORY[store.category]
         for _ in range(BOXES_PER_STORE):
             item_name, item_description = random.choice(item_pool)
-            original_price = round(random.uniform(15000, 60000), -2)  # rupiah-ish
+            original_price = round(random.uniform(15000, 60000), -2)
             discount = random.choice([0.3, 0.4, 0.5])
             box = MysteryBox(
                 store_id=store.id,
@@ -146,8 +168,8 @@ try:
                 original_price=original_price,
                 discounted_price=round(original_price * (1 - discount), -2),
                 quantity=random.randint(1, 10),
-                pickup_start=datetime.utcnow().replace(hour=18, minute=0),
-                pickup_end=datetime.utcnow().replace(hour=20, minute=0),
+                pickup_start=datetime.utcnow(),
+                pickup_end=datetime.utcnow() + timedelta(hours=24),
                 status="available",
             )
             db.add(box)
@@ -155,7 +177,7 @@ try:
 
     db.flush()
 
-    # --- EcoTracker: one per customer, starts at zero ---
+    # --- EcoTracker ---
     for customer in customers:
         db.add(EcoTracker(
             user_id=customer.id,
@@ -176,7 +198,7 @@ try:
             claimed_at=claimed_at,
         )
         db.add(reservation)
-        db.flush()  # get reservation.id
+        db.flush()
 
         db.add(Transaction(
             reservation_id=reservation.id,
@@ -193,7 +215,6 @@ try:
 
     total_reservations = 0
 
-    # --- Guaranteed reservations: every store gets some claimed 'yesterday' ---
     for store in stores:
         store_boxes = [b for b in boxes if b.store_id == store.id]
         for _ in range(GUARANTEED_YESTERDAY_RESERVATIONS_PER_STORE):
@@ -202,7 +223,6 @@ try:
             create_reservation_and_transaction(box, customer, yesterday_random_time())
             total_reservations += 1
 
-    # --- Additional random reservations across the last few days, for variety ---
     n_extra_reservations = min(20, len(boxes) * 2)
     for _ in range(n_extra_reservations):
         box = random.choice(boxes)
@@ -211,7 +231,6 @@ try:
         create_reservation_and_transaction(box, customer, claimed_at)
         total_reservations += 1
 
-    # --- Stock predictions: one per store, using the stub model ---
     for store in stores:
         db.add(StockPrediction(
             store_id=store.id,
@@ -222,10 +241,9 @@ try:
 
     db.commit()
     print(f"Seeded: {len(merchants)} merchants, {len(customers)} customers, "
-          f"{len(stores)} stores (each with a varied opening_time), "
+          f"{len(stores)} stores (each with a real address AND a phone_number), "
           f"{len(boxes)} real food/beverage items, "
-          f"{total_reservations} reservations with transactions "
-          f"({GUARANTEED_YESTERDAY_RESERVATIONS_PER_STORE} per store guaranteed 'yesterday'), "
+          f"{total_reservations} reservations with transactions, "
           f"{len(customers)} eco-tracker records, {len(stores)} stock predictions.")
 
 except Exception as e:

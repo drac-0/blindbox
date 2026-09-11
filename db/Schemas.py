@@ -76,11 +76,3 @@ class EcoTrackerResponse(BaseModel):
 class PredictionResponse(BaseModel):
     store_id: int
     predicted_quantity: int
-
-
-class UserResponse(BaseModel):
-    id: int
-    name: str
-    email: EmailStr
-    role: str
-    created_at: datetime

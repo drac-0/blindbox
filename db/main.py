@@ -2,8 +2,8 @@
 main.py
 
 FastAPI entrypoint for the BlindBox Eco backend.
-Handles: DB session wiring, health check, register/login,
-item listing + detail, SmartStock prediction, EcoTracker
+Handles: DB session wiring, health check, register/login, user
+profile, item listing + detail, SmartStock prediction, EcoTracker
 (read + update), and QuickClaim (reservation + pickup redemption).
 
 Note on payment: there is no payment gateway integration. A
@@ -29,13 +29,13 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from models import Store, Reservation, MysteryBox, StockPrediction, EcoTracker, User
-from Schemas import (
+from schemas import (
     RegisterRequest, LoginRequest, AuthResponse,
     ReservationCreateRequest, ReservationResponse, ClaimRequest, ClaimResponse,
     EcoTrackerUpdateRequest, EcoTrackerResponse, PredictionResponse,
-    UserResponse,
+    UserProfileResponse, UserUpdateRequest,
 )
-from Auth import hash_password, verify_password, create_access_token, decode_access_token
+from auth import hash_password, verify_password, create_access_token, decode_access_token
 from food_data import estimate_co2_saved_kg
 
 load_dotenv()
@@ -117,6 +117,52 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     return AuthResponse(access_token=token, user_id=user.id, name=user.name, role=user.role)
 
 
+@app.get("/users/me", response_model=UserProfileResponse)
+def get_my_profile(current_user: User = Depends(get_current_user)):
+    """
+    Returns the logged-in user's profile — identified from their JWT
+    token, same pattern as /eco-tracker/me. No user_id needed in the
+    URL.
+    """
+    return UserProfileResponse(
+        user_id=current_user.id,
+        name=current_user.name,
+        email=current_user.email,
+        role=current_user.role,
+        created_at=current_user.created_at,
+    )
+
+
+@app.patch("/users/me", response_model=UserProfileResponse)
+def update_my_profile(
+    payload: UserUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Updates the logged-in user's name and/or password. Both fields
+    optional — only send what you want to change. Email is
+    deliberately not editable here to avoid uniqueness-conflict
+    handling within today's timeline.
+    """
+    if payload.name is not None:
+        current_user.name = payload.name
+
+    if payload.password is not None:
+        current_user.password_hash = hash_password(payload.password)
+
+    db.commit()
+    db.refresh(current_user)
+
+    return UserProfileResponse(
+        user_id=current_user.id,
+        name=current_user.name,
+        email=current_user.email,
+        role=current_user.role,
+        created_at=current_user.created_at,
+    )
+
+
 def haversine_km(lat1, lon1, lat2, lon2) -> float:
     R = 6371.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
@@ -151,6 +197,7 @@ def _serialize_item(box: MysteryBox, store: Store, user_lat: Optional[float], us
             "store_id": store.id,
             "name": store.name,
             "address": store.address,
+            "phone_number": store.phone_number,
             "category": store.category,
             "latitude": store.latitude,
             "longitude": store.longitude,
@@ -237,12 +284,6 @@ def compute_previous_sales(db: Session, store_id: int) -> float:
 
 @app.get("/predict-stock/{store_id}", response_model=PredictionResponse)
 async def predict_stock(store_id: int, db: Session = Depends(get_db)):
-    """
-    Returns just the prediction — store_id and predicted_quantity.
-    Internally still computes real features (open_time_hours,
-    previous_sales, day) and saves the full prediction record to
-    stockpredictions, but those inputs aren't part of the response.
-    """
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail=f"Store {store_id} not found")
@@ -343,15 +384,6 @@ def create_reservation(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    Creates a reservation. There is no payment gateway — a successful
-    reservation itself acts as the "payment": it immediately updates
-    the user's EcoTracker with the money saved (original_price -
-    discounted_price) and an estimated CO2 saved figure based on the
-    item's estimated weight. boxes_claimed is also incremented here,
-    at reservation time, not at pickup — reserving IS the completed
-    action in this flow, not a separate pending step.
-    """
     box = db.query(MysteryBox).filter(MysteryBox.id == payload.mysterybox_id).first()
     if not box:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -362,7 +394,6 @@ def create_reservation(
     if datetime.utcnow() > box.pickup_end:
         raise HTTPException(status_code=409, detail="This item's pickup window has ended")
 
-    # Atomic check-and-decrement: prevents double-claiming the last unit
     result = db.execute(
         update(MysteryBox)
         .where(MysteryBox.id == box.id, MysteryBox.quantity > 0)
@@ -376,7 +407,7 @@ def create_reservation(
         mysterybox_id=box.id,
         user_id=current_user.id,
         qr_code=_random_qr_code(),
-        status="pending",  # still awaiting physical pickup/QR redemption
+        status="pending",
         reserved_at=datetime.utcnow(),
     )
     db.add(reservation)
@@ -411,12 +442,6 @@ def create_reservation(
 
 @app.post("/reservations/claim", response_model=ClaimResponse)
 def claim_reservation(payload: ClaimRequest, db: Session = Depends(get_db)):
-    """
-    Marks a reservation as physically picked up (QR scanned at the
-    store). EcoTracker is NOT updated here anymore — that already
-    happened at reservation time, since reserving now acts as the
-    "payment" step. This endpoint only tracks pickup completion.
-    """
     reservation = db.query(Reservation).filter(Reservation.qr_code == payload.qr_code).first()
     if not reservation:
         raise HTTPException(status_code=404, detail="Invalid QR code")
@@ -439,26 +464,3 @@ def claim_reservation(payload: ClaimRequest, db: Session = Depends(get_db)):
         claimed_at=reservation.claimed_at,
         message="Reservation successfully claimed",
     )
-
-
-@app.get("/users/{user_id}", response_model=UserResponse, tags=["Users"])
-def get_user_profile(
-    user_id: int,
-    db: Session = Depends(get_db),
-):
-    user = db.query(User).filter(User.id == user_id).first()
-
-    if not user:
-        raise HTTPException(
-            status_code=404,
-            detail="User tidak ditemukan",
-        )
-
-    return user
-
-
-@app.get("/users/me", response_model=UserResponse, tags=["Users"])
-def get_user_profile(
-    current_user: User = Depends(get_current_user),
-):
-    return current_user
