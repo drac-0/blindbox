@@ -1,5 +1,5 @@
 """
-schemas.py
+Schemas.py
 
 Pydantic models defining the shape of request/response bodies.
 """
@@ -10,13 +10,13 @@ from typing import Optional
 from pydantic import BaseModel, EmailStr
 
 
-
 class UserProfileResponse(BaseModel):
     user_id: int
     name: str
     email: str
     role: str
     created_at: datetime
+
 
 class RegisterRequest(BaseModel):
     name: str
@@ -52,6 +52,27 @@ class ReservationResponse(BaseModel):
     co2_saved_kg: float
 
 
+class ReservationHistoryResponse(BaseModel):
+    reservation_id: int
+    mysterybox_id: int
+
+    title: str
+    description: Optional[str] = None
+    image_url: Optional[str] = None
+
+    amount: float
+
+    status: str
+
+    reserved_at: datetime
+    claimed_at: Optional[datetime] = None
+
+    pickup_start: datetime
+    pickup_end: datetime
+
+    qr_code: str
+
+
 class ClaimRequest(BaseModel):
     qr_code: str
 
@@ -83,8 +104,10 @@ class PredictionResponse(BaseModel):
 
 class UserUpdateRequest(BaseModel):
     """All fields optional — only send what you want to change."""
+
     name: Optional[str] = None
     password: Optional[str] = None
+
 
 class UserResponse(BaseModel):
     id: int

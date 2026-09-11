@@ -9,7 +9,14 @@ StockPredictions).
 from datetime import datetime, time
 
 from sqlalchemy import (
-    Column, Integer, String, Float, Numeric, DateTime, Time, ForeignKey
+    Column,
+    Integer,
+    String,
+    Float,
+    Numeric,
+    DateTime,
+    Time,
+    ForeignKey,
 )
 from sqlalchemy.orm import relationship
 
@@ -76,21 +83,43 @@ class Reservation(Base):
     id = Column(Integer, primary_key=True, index=True)
     mysterybox_id = Column(Integer, ForeignKey("mysteryboxes.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
     qr_code = Column(String(64), unique=True, nullable=False)
-    status = Column(String(20), default="pending")
+
+    # Reservation lifecycle:
+    #
+    # processed = reservation has been successfully made
+    # done      = user has confirmed that the food was received
+    #
+    # Other statuses such as "expired" can still be used later.
+    status = Column(String(20), default="processed")
+
     reserved_at = Column(DateTime, default=datetime.utcnow)
+
+    # Existing database column.
+    # We keep the name "claimed_at" to avoid requiring a DB migration.
+    # Semantically, this is the time the user confirmed receiving the food.
     claimed_at = Column(DateTime, nullable=True)
 
     mystery_box = relationship("MysteryBox", back_populates="reservations")
     user = relationship("User", back_populates="reservations")
-    transaction = relationship("Transaction", back_populates="reservation", uselist=False)
+    transaction = relationship(
+        "Transaction",
+        back_populates="reservation",
+        uselist=False,
+    )
 
 
 class Transaction(Base):
     __tablename__ = "transactions"
 
     id = Column(Integer, primary_key=True, index=True)
-    reservation_id = Column(Integer, ForeignKey("reservations.id"), nullable=False, unique=True)
+    reservation_id = Column(
+        Integer,
+        ForeignKey("reservations.id"),
+        nullable=False,
+        unique=True,
+    )
     amount = Column(Numeric(10, 2), nullable=False)
     method = Column(String(30))
     status = Column(String(20), default="paid")
@@ -104,10 +133,16 @@ class EcoTracker(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True)
+
     total_savings = Column(Numeric(10, 2), default=0)
     total_co2_saved = Column(Numeric(10, 2), default=0)
     boxes_claimed = Column(Integer, default=0)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    updated_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
 
     user = relationship("User", back_populates="eco_tracker")
 

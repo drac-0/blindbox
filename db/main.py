@@ -30,10 +30,20 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import Store, Reservation, MysteryBox, StockPrediction, EcoTracker, User
 from Schemas import (
-    RegisterRequest, LoginRequest, AuthResponse,
-    ReservationCreateRequest, ReservationResponse, ClaimRequest, ClaimResponse,
-    EcoTrackerUpdateRequest, EcoTrackerResponse, PredictionResponse,
-    UserProfileResponse, UserUpdateRequest,UserResponse
+    RegisterRequest,
+    LoginRequest,
+    AuthResponse,
+    ReservationCreateRequest,
+    ReservationResponse,
+    ReservationHistoryResponse,
+    ClaimRequest,
+    ClaimResponse,
+    EcoTrackerUpdateRequest,
+    EcoTrackerResponse,
+    PredictionResponse,
+    UserProfileResponse,
+    UserUpdateRequest,
+    UserResponse,
 )
 from Auth import hash_password, verify_password, create_access_token, decode_access_token
 from food_data import estimate_co2_saved_kg
@@ -264,22 +274,33 @@ def compute_open_time_hours(opening_time) -> float:
 
 
 def compute_previous_sales(db: Session, store_id: int) -> float:
-    window_end = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    window_end = datetime.utcnow().replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
     window_start = window_end - timedelta(days=7)
 
-    total_claimed = (
+    total_completed = (
         db.query(func.count(Reservation.id))
-        .join(MysteryBox, Reservation.mysterybox_id == MysteryBox.id)
+        .join(
+            MysteryBox,
+            Reservation.mysterybox_id == MysteryBox.id,
+        )
         .filter(
             MysteryBox.store_id == store_id,
-            Reservation.status == "claimed",
+            Reservation.status == "done",
             Reservation.claimed_at >= window_start,
             Reservation.claimed_at < window_end,
         )
         .scalar()
     )
-    total_claimed = total_claimed or 0
-    return round(total_claimed / 7, 2)
+
+    total_completed = total_completed or 0
+
+    return round(total_completed / 7, 2)
 
 
 @app.get("/predict-stock/{store_id}", response_model=PredictionResponse)
@@ -375,7 +396,12 @@ def get_eco_tracker(user_id: int, db: Session = Depends(get_db)):
 
 
 def _random_qr_code() -> str:
-    return "".join(random.choices(string.ascii_uppercase + string.digits, k=12))
+    return "".join(
+        random.choices(
+            string.ascii_uppercase + string.digits,
+            k=12,
+        )
+    )
 
 
 @app.post("/reservations", response_model=ReservationResponse)
@@ -384,39 +410,76 @@ def create_reservation(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    box = db.query(MysteryBox).filter(MysteryBox.id == payload.mysterybox_id).first()
+    box = (
+        db.query(MysteryBox)
+        .filter(MysteryBox.id == payload.mysterybox_id)
+        .first()
+    )
+
     if not box:
-        raise HTTPException(status_code=404, detail="Item not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Item not found",
+        )
 
     if box.status != "available":
-        raise HTTPException(status_code=409, detail="This item is no longer available")
+        raise HTTPException(
+            status_code=409,
+            detail="This item is no longer available",
+        )
 
     if datetime.utcnow() > box.pickup_end:
-        raise HTTPException(status_code=409, detail="This item's pickup window has ended")
+        raise HTTPException(
+            status_code=409,
+            detail="This item's pickup window has ended",
+        )
 
+    # Atomically decrease stock.
     result = db.execute(
         update(MysteryBox)
-        .where(MysteryBox.id == box.id, MysteryBox.quantity > 0)
-        .values(quantity=MysteryBox.quantity - 1)
+        .where(
+            MysteryBox.id == box.id,
+            MysteryBox.quantity > 0,
+        )
+        .values(
+            quantity=MysteryBox.quantity - 1
+        )
     )
+
     if result.rowcount == 0:
         db.rollback()
-        raise HTTPException(status_code=409, detail="This item just sold out")
+
+        raise HTTPException(
+            status_code=409,
+            detail="This item just sold out",
+        )
 
     reservation = Reservation(
         mysterybox_id=box.id,
         user_id=current_user.id,
         qr_code=_random_qr_code(),
-        status="pending",  # awaiting pickup confirmation — EcoTracker is NOT updated yet
+
+        # New lifecycle:
+        # processed -> waiting for pickup
+        # done      -> user confirmed pickup
+        status="processed",
+
         reserved_at=datetime.utcnow(),
     )
+
     db.add(reservation)
     db.flush()
 
-    # Preview values only — shown to the user now so they know what
-    # they'll earn, but NOT yet applied to EcoTracker. That happens in
-    # /reservations/claim, once pickup is actually confirmed.
-    savings = float(box.original_price) - float(box.discounted_price)
+    # Preview only.
+    #
+    # EcoTracker is NOT updated here.
+    # It will only be updated after the user confirms
+    # that the food was actually received.
+    savings = (
+        float(box.original_price)
+        - float(box.discounted_price)
+    )
+
     co2_saved = estimate_co2_saved_kg(box.title)
 
     db.commit()
@@ -430,6 +493,133 @@ def create_reservation(
         reserved_at=reservation.reserved_at,
         amount=float(box.discounted_price),
         co2_saved_kg=co2_saved,
+    )
+
+
+
+
+@app.patch(
+    "/reservations/{reservation_id}/confirm",
+    response_model=ClaimResponse,
+)
+def confirm_reservation(
+    reservation_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    User confirms that the food has actually been received.
+
+    processed -> done
+
+    This is deliberately authenticated using the user's JWT.
+    A user cannot confirm another user's reservation.
+    """
+
+    reservation = (
+        db.query(Reservation)
+        .filter(
+            Reservation.id == reservation_id,
+            Reservation.user_id == current_user.id,
+        )
+        .first()
+    )
+
+    if not reservation:
+        raise HTTPException(
+            status_code=404,
+            detail="Reservation not found",
+        )
+
+    if reservation.status == "done":
+        raise HTTPException(
+            status_code=409,
+            detail="This reservation was already completed",
+        )
+
+    if reservation.status == "expired":
+        raise HTTPException(
+            status_code=409,
+            detail="This reservation has expired",
+        )
+
+    if reservation.status != "processed":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This reservation cannot be completed "
+                f"from status '{reservation.status}'"
+            ),
+        )
+
+    box = (
+        db.query(MysteryBox)
+        .filter(
+            MysteryBox.id == reservation.mysterybox_id
+        )
+        .first()
+    )
+
+    if not box:
+        raise HTTPException(
+            status_code=404,
+            detail="Mystery box not found",
+        )
+
+    # Mark reservation as completed.
+    reservation.status = "done"
+
+    # We keep using the existing claimed_at database column
+    # so no ALTER TABLE / migration is required.
+    reservation.claimed_at = datetime.utcnow()
+
+    # Calculate EcoTracker reward.
+    savings = (
+        float(box.original_price)
+        - float(box.discounted_price)
+    )
+
+    co2_saved = estimate_co2_saved_kg(box.title)
+
+    tracker = (
+        db.query(EcoTracker)
+        .filter(
+            EcoTracker.user_id == current_user.id
+        )
+        .first()
+    )
+
+    if not tracker:
+        tracker = EcoTracker(
+            user_id=current_user.id,
+            total_savings=0,
+            total_co2_saved=0,
+            boxes_claimed=0,
+        )
+
+        db.add(tracker)
+        db.flush()
+
+    tracker.total_savings = (
+        float(tracker.total_savings)
+        + savings
+    )
+
+    tracker.total_co2_saved = (
+        float(tracker.total_co2_saved)
+        + co2_saved
+    )
+
+    tracker.boxes_claimed += 1
+
+    db.commit()
+    db.refresh(reservation)
+
+    return ClaimResponse(
+        reservation_id=reservation.id,
+        status=reservation.status,
+        claimed_at=reservation.claimed_at,
+        message="Pesanan berhasil dikonfirmasi sebagai sudah diambil",
     )
 
 
@@ -496,8 +686,15 @@ def get_user_profile(
 
     return user
 
-@app.get("/users/me", response_model=UserResponse, tags=["Users"])
-def get_user_profile(
-    current_user: User = Depends(get_current_user),
+
+@app.get("/users/me", response_model=UserProfileResponse)
+def get_my_profile(
+    current_user: User = Depends(get_current_user)
 ):
-    return current_user
+    return UserProfileResponse(
+        user_id=current_user.id,
+        name=current_user.name,
+        email=current_user.email,
+        role=current_user.role,
+        created_at=current_user.created_at,
+    )
