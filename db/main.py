@@ -496,7 +496,6 @@ def get_user_profile(
 
     return user
 
-
 @app.get("/users/me", response_model=UserResponse, tags=["Users"])
 def get_user_profile(
     current_user: User = Depends(get_current_user),
