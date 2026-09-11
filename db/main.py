@@ -33,7 +33,7 @@ from Schemas import (
     RegisterRequest, LoginRequest, AuthResponse,
     ReservationCreateRequest, ReservationResponse, ClaimRequest, ClaimResponse,
     EcoTrackerUpdateRequest, EcoTrackerResponse, PredictionResponse,
-    UserProfileResponse, UserUpdateRequest,
+    UserResponse, UserUpdateRequest,
 )
 from Auth import hash_password, verify_password, create_access_token, decode_access_token
 from food_data import estimate_co2_saved_kg
@@ -480,6 +480,7 @@ def claim_reservation(payload: ClaimRequest, db: Session = Depends(get_db)):
         claimed_at=reservation.claimed_at,
         message="Reservation successfully claimed",
     )
+
 
 @app.get("/users/{user_id}", response_model=UserResponse, tags=["Users"])
 def get_user_profile(user_id: int):
