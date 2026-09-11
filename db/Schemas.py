@@ -10,6 +10,14 @@ from typing import Optional
 from pydantic import BaseModel, EmailStr
 
 
+
+class UserProfileResponse(BaseModel):
+    user_id: int
+    name: str
+    email: str
+    role: str
+    created_at: datetime
+
 class RegisterRequest(BaseModel):
     name: str
     email: EmailStr
@@ -73,20 +81,10 @@ class PredictionResponse(BaseModel):
     predicted_quantity: int
 
 
-class UserProfileResponse(BaseModel):
-    user_id: int
-    name: str
-    email: str
-    role: str
-    created_at: datetime
-
-
 class UserUpdateRequest(BaseModel):
     """All fields optional — only send what you want to change."""
     name: Optional[str] = None
     password: Optional[str] = None
-
-
 
 class UserResponse(BaseModel):
     id: int
