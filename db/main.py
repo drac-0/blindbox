@@ -407,24 +407,17 @@ def create_reservation(
         mysterybox_id=box.id,
         user_id=current_user.id,
         qr_code=_random_qr_code(),
-        status="pending",
+        status="pending",  # awaiting pickup confirmation — EcoTracker is NOT updated yet
         reserved_at=datetime.utcnow(),
     )
     db.add(reservation)
     db.flush()
 
+    # Preview values only — shown to the user now so they know what
+    # they'll earn, but NOT yet applied to EcoTracker. That happens in
+    # /reservations/claim, once pickup is actually confirmed.
     savings = float(box.original_price) - float(box.discounted_price)
     co2_saved = estimate_co2_saved_kg(box.title)
-
-    tracker = db.query(EcoTracker).filter(EcoTracker.user_id == current_user.id).first()
-    if not tracker:
-        tracker = EcoTracker(user_id=current_user.id, total_savings=0, total_co2_saved=0, boxes_claimed=0)
-        db.add(tracker)
-        db.flush()
-
-    tracker.total_savings = float(tracker.total_savings) + savings
-    tracker.total_co2_saved = float(tracker.total_co2_saved) + co2_saved
-    tracker.boxes_claimed += 1
 
     db.commit()
     db.refresh(reservation)
@@ -442,6 +435,13 @@ def create_reservation(
 
 @app.post("/reservations/claim", response_model=ClaimResponse)
 def claim_reservation(payload: ClaimRequest, db: Session = Depends(get_db)):
+    """
+    Confirms pickup (step 3 of the flow: reserve -> wait -> confirm
+    pickup). This is the point where the database actually reflects
+    a completed food rescue — EcoTracker (savings, CO2, boxes_claimed)
+    is updated HERE, not at reservation time, since the order isn't
+    truly complete until pickup is confirmed.
+    """
     reservation = db.query(Reservation).filter(Reservation.qr_code == payload.qr_code).first()
     if not reservation:
         raise HTTPException(status_code=404, detail="Invalid QR code")
@@ -452,8 +452,24 @@ def claim_reservation(payload: ClaimRequest, db: Session = Depends(get_db)):
     if reservation.status == "expired":
         raise HTTPException(status_code=409, detail="This reservation has expired")
 
+    box = db.query(MysteryBox).filter(MysteryBox.id == reservation.mysterybox_id).first()
+
     reservation.status = "claimed"
     reservation.claimed_at = datetime.utcnow()
+
+    if box:
+        savings = float(box.original_price) - float(box.discounted_price)
+        co2_saved = estimate_co2_saved_kg(box.title)
+
+        tracker = db.query(EcoTracker).filter(EcoTracker.user_id == reservation.user_id).first()
+        if not tracker:
+            tracker = EcoTracker(user_id=reservation.user_id, total_savings=0, total_co2_saved=0, boxes_claimed=0)
+            db.add(tracker)
+            db.flush()
+
+        tracker.total_savings = float(tracker.total_savings) + savings
+        tracker.total_co2_saved = float(tracker.total_co2_saved) + co2_saved
+        tracker.boxes_claimed += 1
 
     db.commit()
     db.refresh(reservation)
@@ -464,3 +480,25 @@ def claim_reservation(payload: ClaimRequest, db: Session = Depends(get_db)):
         claimed_at=reservation.claimed_at,
         message="Reservation successfully claimed",
     )
+
+@app.get("/users/{user_id}", response_model=UserResponse, tags=["Users"])
+def get_user_profile(
+    user_id: int,
+    db: Session = Depends(get_db),
+):
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User tidak ditemukan",
+        )
+
+    return user
+
+
+@app.get("/users/me", response_model=UserResponse, tags=["Users"])
+def get_user_profile(
+    current_user: User = Depends(get_current_user),
+):
+    return current_user
