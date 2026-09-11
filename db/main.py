@@ -29,13 +29,13 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from models import Store, Reservation, MysteryBox, StockPrediction, EcoTracker, User
-from schemas import (
+from Schemas import (
     RegisterRequest, LoginRequest, AuthResponse,
     ReservationCreateRequest, ReservationResponse, ClaimRequest, ClaimResponse,
     EcoTrackerUpdateRequest, EcoTrackerResponse, PredictionResponse,
     UserProfileResponse, UserUpdateRequest,
 )
-from auth import hash_password, verify_password, create_access_token, decode_access_token
+from Auth import hash_password, verify_password, create_access_token, decode_access_token
 from food_data import estimate_co2_saved_kg
 
 load_dotenv()

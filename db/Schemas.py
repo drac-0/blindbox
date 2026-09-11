@@ -56,11 +56,6 @@ class ClaimResponse(BaseModel):
 
 
 class EcoTrackerUpdateRequest(BaseModel):
-    """
-    Increments to apply to the logged-in user's EcoTracker. All fields
-    optional — only send what you want to add. Values are added to
-    the existing totals, not used to overwrite them.
-    """
     savings_delta: Optional[float] = 0
     co2_delta: Optional[float] = 0
     boxes_delta: Optional[int] = 0
@@ -76,3 +71,26 @@ class EcoTrackerResponse(BaseModel):
 class PredictionResponse(BaseModel):
     store_id: int
     predicted_quantity: int
+
+
+class UserProfileResponse(BaseModel):
+    user_id: int
+    name: str
+    email: str
+    role: str
+    created_at: datetime
+
+
+class UserUpdateRequest(BaseModel):
+    """All fields optional — only send what you want to change."""
+    name: Optional[str] = None
+    password: Optional[str] = None
+
+
+
+class UserResponse(BaseModel):
+    id: int
+    name: str
+    email: EmailStr
+    role: str
+    created_at: datetime
