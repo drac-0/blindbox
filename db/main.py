@@ -482,6 +482,11 @@ def claim_reservation(payload: ClaimRequest, db: Session = Depends(get_db)):
     )
 
 @app.get("/users/{user_id}", response_model=UserResponse, tags=["Users"])
+def get_user_profile(user_id: int):
+    for user in fake_users:
+        if user["user_id"] == user_id:
+            return user
+    raise HTTPException(status_code=404, detail="User tidak ditemukan")
 def get_user_profile(
     user_id: int,
     db: Session = Depends(get_db),
@@ -495,6 +500,7 @@ def get_user_profile(
         )
 
     return user
+
 
 @app.get("/users/me", response_model=UserResponse, tags=["Users"])
 def get_user_profile(
